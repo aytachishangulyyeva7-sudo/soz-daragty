@@ -1,10 +1,10 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useGameState } from '../hooks/useGameState';
 import { PlayCircle, RotateCcw, Trophy, Zap, RefreshCw, PauseCircle, Play } from 'lucide-react';
 import { soundManager } from '../utils/SoundManager';
-import { single, update, getWordsByLength, addWord } from '../lib/localDb';
+import { single, update, getWordsByLength, addWord, query } from '../lib/localDb';
 import { useCountdown } from '../hooks/useCountdown';
-import { sendUpdate } from '../utils/WebSocketClient';
+import { broadcastState, type GameStatePayload } from '../utils/WebSocketClient';
 
 interface WordItem {
   id: string;
@@ -34,47 +34,114 @@ export const AdminDashboard = ({ sessionId }: AdminDashboardProps) => {
 
   const isTimerPaused = gameState?.timer_active === 0 && gameState?.timer_started_at !== null;
 
-const handleTimeout = async () => {
-  if (!gameState || !currentGroupId) return;
+  /**
+   * ESASY FUNKSIÝA: DB-den täze state-i okap, ähli klientlere ýaýrat
+   * KEY FUNCTION: Read fresh state from DB and broadcast to all clients
+   * BU REALTIME SYNC ÜÇIN KRITIKI!
+   * THIS IS CRITICAL FOR REALTIME SYNC!
+   */
+  const broadcastCurrentState = useCallback(async () => {
+    try {
+      // DB-den täze session state-ini al
+      const session = await single(
+        'SELECT * FROM game_sessions WHERE id = ?',
+        [sessionId]
+      );
 
-  const newAttempts = (gameState.attempts_used || 0) + 1;
-  const currentLength = gameState?.current_word?.length || 4;
-  const timeoutGuess = {
-    word: ''.padEnd(currentLength, ' '),
-    results: Array(currentLength).fill({ letter: '', status: 'timeout' })
-  };
+      if (!session) {
+        console.warn('⚠️ Session tapylmady broadcast üçin');
+        return;
+      }
 
-  const newGuesses = [...(gameState.guesses || []), timeoutGuess];
+      // Toparlary al
+      const groupList = await query(
+        'SELECT * FROM groups WHERE session_id = ? ORDER BY turn_order',
+        [sessionId]
+      );
 
-  await update(
-    'game_state',
-    {
-      timer_active: 0,
-      timer_started_at: null,
-      attempts_used: newAttempts,
-      guesses: JSON.stringify(newGuesses),
-    },
-    'session_id = ? AND group_id = ?',
-    [sessionId, currentGroupId]
-  );
+      // Häzirki toparyň game state-ini al
+      let currentGameState = null;
+      if (session.current_group_id) {
+        const state = await single(
+          'SELECT * FROM game_state WHERE session_id = ? AND group_id = ?',
+          [sessionId, session.current_group_id]
+        );
 
-  // YANLIŞ SESİ ÇAL
-  playWrongDelayed();
+        if (state) {
+          currentGameState = {
+            ...state,
+            guesses: state.guesses // String hökmünde sakla (klient parse eder)
+          };
+        }
+      }
 
-  if (newAttempts >= 6) {
+      // Doly payload döret we ýaýrat
+      const payload: GameStatePayload = {
+        type: 'FULL_STATE_UPDATE',
+        sessionId: sessionId,
+        gameSession: session,
+        groups: groupList || [],
+        gameState: currentGameState,
+        timestamp: Date.now()
+      };
+
+      // WebSocket arkaly ähli klientlere ýaýrat
+      broadcastState(payload);
+
+      console.log('✅ State ýaýradyldy:', {
+        word: currentGameState?.current_word,
+        attempts: currentGameState?.attempts_used,
+        timer: currentGameState?.timer_active ? 'IŞLEÝÄR' : 'DURDY'
+      });
+    } catch (error) {
+      console.error('❌ State ýaýratmakda säwlik:', error);
+    }
+  }, [sessionId]);
+
+  const handleTimeout = async () => {
+    if (!gameState || !currentGroupId) return;
+
+    const newAttempts = (gameState.attempts_used || 0) + 1;
+    const currentLength = gameState?.current_word?.length || 4;
+    const timeoutGuess = {
+      word: ''.padEnd(currentLength, ' '),
+      results: Array(currentLength).fill({ letter: '', status: 'timeout' })
+    };
+
+    const newGuesses = [...(gameState.guesses || []), timeoutGuess];
+
     await update(
       'game_state',
-      { current_word: null, current_word_id: null, guesses: '[]' },
+      {
+        timer_active: 0,
+        timer_started_at: null,
+        attempts_used: newAttempts,
+        guesses: JSON.stringify(newGuesses),
+      },
       'session_id = ? AND group_id = ?',
       [sessionId, currentGroupId]
     );
-  } else {
-    setTimeout(startTimer, 800); // Yeni deneme için timer'ı 30sn'den başlat
-  }
 
-  soundManager.stopTension();
-  soundManager.stopTicking();
-};
+    // State-i ýaýrat
+    await broadcastCurrentState();
+
+    playWrongDelayed();
+
+    if (newAttempts >= 6) {
+      await update(
+        'game_state',
+        { current_word: null, current_word_id: null, guesses: '[]' },
+        'session_id = ? AND group_id = ?',
+        [sessionId, currentGroupId]
+      );
+      await broadcastCurrentState();
+    } else {
+      setTimeout(startTimer, 800);
+    }
+
+    soundManager.stopTension();
+    soundManager.stopTicking();
+  };
 
   const timeRemaining = useCountdown(
     gameState?.timer_active || false,
@@ -101,22 +168,22 @@ const handleTimeout = async () => {
     inputRef.current?.focus();
   }, [gameState?.current_word]);
 
-useEffect(() => {
-  if (gameSession) {
-    soundManager.startTension(1.0);
-  }
+  useEffect(() => {
+    if (gameSession) {
+      soundManager.startTension(1.0);
+    }
 
-  if (gameState?.timer_active) {
-    soundManager.startTicking(); // Bu otomatik tension'ı durdurur
-  } else {
-    soundManager.stopTicking();
-    soundManager.startTension(0.5); // Pause'da hafif tension çalsın
-  }
+    if (gameState?.timer_active) {
+      soundManager.startTicking();
+    } else {
+      soundManager.stopTicking();
+      soundManager.startTension(0.5);
+    }
 
-  return () => {
-    soundManager.stopAll();
-  };
-}, [gameState?.timer_active, gameSession]);
+    return () => {
+      soundManager.stopAll();
+    };
+  }, [gameState?.timer_active, gameSession]);
 
   const playCorrectDelayed = () => setTimeout(() => {
     soundManager.playCorrect();
@@ -139,24 +206,26 @@ useEffect(() => {
   };
 
   const startNewRound = async (wordId: string) => {
-  const wordRow: any = await single('SELECT word FROM words WHERE id = ?', [wordId]);
-  if (!wordRow || !currentGroupId) return;
+    const wordRow: any = await single('SELECT word FROM words WHERE id = ?', [wordId]);
+    if (!wordRow || !currentGroupId) return;
 
-  await update(
-    'game_state',
-    {
-      current_word: wordRow.word,
-      current_word_id: wordId,
-      attempts_used: 0,
-      guesses: '[]',
-      timer_active: 0,
-      timer_started_at: null,
-    },
-    'session_id = ? AND group_id = ?',
-    [sessionId, currentGroupId]
-  );
-  sendUpdate();
-};
+    await update(
+      'game_state',
+      {
+        current_word: wordRow.word,
+        current_word_id: wordId,
+        attempts_used: 0,
+        guesses: '[]',
+        timer_active: 0,
+        timer_started_at: null,
+      },
+      'session_id = ? AND group_id = ?',
+      [sessionId, currentGroupId]
+    );
+
+    // Derrew ýaýrat (immediately broadcast)
+    await broadcastCurrentState();
+  };
 
   const startTimer = async () => {
     if (!currentGroupId) return;
@@ -166,7 +235,7 @@ useEffect(() => {
       'session_id = ? AND group_id = ?',
       [sessionId, currentGroupId]
     );
-    sendUpdate();
+    await broadcastCurrentState();
   };
 
   const pauseTimer = async () => {
@@ -177,7 +246,7 @@ useEffect(() => {
       'session_id = ? AND group_id = ?',
       [sessionId, currentGroupId]
     );
-    sendUpdate();
+    await broadcastCurrentState();
   };
 
   const resumeTimer = async () => {
@@ -201,7 +270,7 @@ useEffect(() => {
       'session_id = ? AND group_id = ?',
       [sessionId, currentGroupId]
     );
-    sendUpdate();
+    await broadcastCurrentState();
   };
 
   const submitGuess = async () => {
@@ -267,10 +336,13 @@ useEffect(() => {
       const newScore = (currentGroup?.score || 0) + points;
 
       await update('groups', { score: newScore }, 'id = ?', [currentGroupId]);
+      await broadcastCurrentState();
       setTimeout(resetRound, 6000);
     } else {
       playWrongDelayed();
       soundManager.stopTicking();
+
+      await broadcastCurrentState();
 
       if (attempts >= 6) {
         setTimeout(resetRound, 3000);
@@ -282,11 +354,11 @@ useEffect(() => {
             'session_id = ? AND group_id = ?',
             [sessionId, currentGroupId]
           );
+          await broadcastCurrentState();
         }, 800);
       }
     }
     setGuess('');
-    sendUpdate();
   };
 
   const resetRound = async () => {
@@ -311,16 +383,19 @@ useEffect(() => {
       soundManager.startTension(1.0);
       soundManager.setTensionVolume(0.5);
     }
-    sendUpdate();
+
+    await broadcastCurrentState();
   };
 
   const changeGroup = async (groupId: string) => {
     await update('game_sessions', { current_group_id: groupId }, 'id = ?', [sessionId]);
+    await broadcastCurrentState();
   };
 
   const nextRound = async () => {
     if (currentRound >= 3) return;
     await update('game_sessions', { current_round: currentRound + 1 }, 'id = ?', [sessionId]);
+    await broadcastCurrentState();
   };
 
   const restartGame = async () => {
@@ -347,6 +422,8 @@ useEffect(() => {
         [sessionId, currentGroupId]
       );
     }
+
+    await broadcastCurrentState();
   };
 
   if (loading) return <div className="min-h-screen flex items-center justify-center text-white text-xl">Yuklenýär...</div>;
